@@ -25,7 +25,6 @@ jobs:
 
       - name: 运行股票日报脚本
         env:
-          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           HUNYUAN_API_KEY: ${{ secrets.HUNYUAN_API_KEY }}
         run: python main.py
