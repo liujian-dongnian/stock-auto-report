@@ -4,22 +4,28 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: '0 23 * * *'   # 北京时间 7:30（对应 UTC 23:00）
+    - cron: '30 23 * * *'   # 北京时间 7:30（UTC+8 = UTC 23:30）
+  workflow_dispatch:        # 支持手动触发（调试用）
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
+
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+
       - name: 安装依赖
         run: pip install -r requirements.txt
-      - name: 运行脚本
+
+      - name: 运行股票日报脚本
         env:
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          WORKBUDDY_API_KEY: ${{ secrets.WORKBUDDY_API_KEY }}
+          HUNYUAN_API_KEY: ${{ secrets.HUNYUAN_API_KEY }}
         run: python main.py
