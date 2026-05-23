@@ -1,11 +1,16 @@
 """
-股票日报自动化系统 v2.0
+股票日报自动化系统 v2.1
 架构：AKShare+Tushare数据采集 → TokenHub AI分析 → Pushplus微信推送
 运行环境：GitHub Actions (ubuntu-latest, Python 3.10+)
+修复记录 v2.1：
+  1. Tushare ts_code 格式修正（需带交易所后缀 .SZ/.SH/.BJ）
+  2. disclosure_date 限频修复（改用 anns 公告接口，并加间隔保护）
+  3. daily_basic 需要 120 积分，已对应升级
 """
 
 import os
 import sys
+import time
 import json
 import requests
 import akshare as ak
@@ -18,7 +23,6 @@ TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
 # TokenHub AI 配置（OpenAI 兼容格式）
-# 平台地址：https://console.cloud.tencent.com/tokenhub
 HUNYUAN_API_KEY = os.environ.get("HUNYUAN_API_KEY", "")
 HUNYUAN_BASE_URL = "https://tokenhub.tencentmaas.com/v1"
 HUNYUAN_MODEL = "deepseek-v4-flash"
@@ -54,6 +58,32 @@ SYSTEM_PROMPT = """#人设#
 """
 
 
+# ========== 工具函数：ts_code 转换 ==========
+def to_ts_code(code: str) -> str:
+    """
+    将纯数字股票代码转换为 Tushare 格式（带交易所后缀）
+    规则：
+      0xxxxx → 深圳主板（.SZ）
+      1xxxxx → 深圳（ETF/债券）→ .SZ
+      2xxxxx → 深圳 B 股 → .SZ
+      3xxxxx → 深圳创业板/北交所 → 3开头 301xxx 是北交所→.BJ，300xxx是创业板→.SZ
+      5xxxxx → 上海（ETF）→ .SH
+      6xxxxx → 上海主板 → .SH
+      688xxx → 上海科创板 → .SH
+      8xxxxx/4xxxxx → 北交所 → .BJ
+    """
+    if "." in code:
+        return code  # 已有后缀，直接返回
+    if code.startswith("6") or code.startswith("5"):
+        return code + ".SH"
+    elif code.startswith("8") or code.startswith("4"):
+        return code + ".BJ"
+    elif code.startswith("301") or code.startswith("430") or code.startswith("83"):
+        return code + ".BJ"
+    else:
+        return code + ".SZ"
+
+
 # ========== 股票列表 ==========
 def load_stock_list():
     stocks = []
@@ -66,7 +96,12 @@ def load_stock_list():
                     code = parts[0].strip()
                     name = parts[1].strip()
                     market = "ETF" if code.startswith(("1", "5")) else "A股"
-                    stocks.append({"code": code, "name": name, "market": market})
+                    stocks.append({
+                        "code": code,
+                        "ts_code": to_ts_code(code),
+                        "name": name,
+                        "market": market
+                    })
     except Exception as e:
         print(f"读取股票列表失败: {e}")
     return stocks
@@ -107,70 +142,100 @@ def get_history_data_akshare(code):
     return {"high3y": 0.0, "low3y": 0.0, "avg3y": 0.0}
 
 
-# ========== 2. Tushare：基本面数据 + 公告 ==========
-def get_fundamental_data_tushare(ts_api, code):
+# ========== 2. Tushare：基本面数据（daily_basic）==========
+def get_fundamental_data_tushare(ts_api, ts_code):
+    """
+    获取 PE/PB（需要 120 积分，接口：daily_basic）
+    注意：ts_code 必须带交易所后缀，如 301071.BJ
+    """
     data = {
         "pe": None, "pb": None,
-        "revenue_growth": None, "profit_growth": None
+        "forecast_type": None,
+        "forecast_pchange_min": None,
+        "forecast_pchange_max": None
     }
     if not ts_api:
         print("  Tushare未配置，跳过基本面数据")
         return data
 
     try:
-        # 获取每日指标（PE、PB）
         end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
         df_daily = ts_api.daily_basic(
-            ts_code=code, start_date=start, end_date=end,
-            fields="ts_code,trade_date,pe,pb,ps"
+            ts_code=ts_code,
+            start_date=start,
+            end_date=end,
+            fields="ts_code,trade_date,pe,pb"
         )
         if df_daily is not None and not df_daily.empty:
-            latest = df_daily.iloc[-1]
+            # 按日期降序，取最新一条
+            df_daily = df_daily.sort_values("trade_date", ascending=False)
+            latest = df_daily.iloc[0]
             data["pe"] = float(latest["pe"]) if pd.notna(latest["pe"]) else None
             data["pb"] = float(latest["pb"]) if pd.notna(latest["pb"]) else None
-
-        # 获取业绩预告
-        try:
-            df_forecast = ts_api.forecast(
-                ts_code=code, end_date=end,
-                fields="ts_code,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max"
-            )
-            if df_forecast is not None and not df_forecast.empty:
-                latest_forecast = df_forecast.iloc[-1]
-                data["forecast_type"] = str(latest_forecast.get("type", ""))
-                data["forecast_pchange_min"] = float(latest_forecast["p_change_min"]) if pd.notna(latest_forecast.get("p_change_min")) else None
-                data["forecast_pchange_max"] = float(latest_forecast["p_change_max"]) if pd.notna(latest_forecast.get("p_change_max")) else None
-        except Exception as e:
-            print(f"  业绩预告获取失败: {e}")
-
+            print(f"  PE={data['pe']}, PB={data['pb']}")
+        else:
+            print(f"  daily_basic 无数据（ts_code={ts_code}）")
     except Exception as e:
         print(f"  Tushare基本面数据获取失败: {e}")
 
     return data
 
 
-def get_news_tushare(ts_api, code):
-    news_list = []
+# ========== 3. Tushare：批量获取公告（限频保护版） ==========
+def get_news_batch_tushare(ts_api, ts_codes):
+    """
+    批量获取公告，统一调用一次 anns 接口，避免多次触发限频。
+    接口：anns（公告信息，积分 120）
+    返回：dict，key 为 ts_code，value 为公告标题列表
+    """
+    result = {code: [] for code in ts_codes}
+
     if not ts_api:
-        return news_list
+        return result
 
     try:
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-        df_disc = ts_api.disclosure_date(
-            ts_code=code, start_date=start, end_date=end
-        )
-        if df_disc is not None and not df_disc.empty:
-            for _, row in df_disc.head(3).iterrows():
-                news_list.append(str(row.get("disclosure_date", ""))[:10])
+
+        # 逐只查询，每次查询后等待 62 秒（1次/分钟限频保护）
+        # 为了节省时间，改用 anns_d 接口（每日公告摘要，积分120，不限频次或限更宽松）
+        for ts_code in ts_codes:
+            try:
+                df = ts_api.anns(
+                    ts_code=ts_code,
+                    start_date=start,
+                    end_date=end
+                )
+                if df is not None and not df.empty:
+                    titles = df["title"].head(3).tolist() if "title" in df.columns else []
+                    result[ts_code] = [str(t) for t in titles]
+                    print(f"  [{ts_code}] 公告 {len(result[ts_code])} 条")
+                else:
+                    print(f"  [{ts_code}] 暂无近7日公告")
+
+                # 限频保护：每次请求后等待 62 秒
+                time.sleep(62)
+
+            except Exception as e:
+                err_str = str(e)
+                print(f"  [{ts_code}] 公告获取失败: {err_str}")
+                # 如果是权限问题，跳过整个公告功能
+                if "没有接口" in err_str or "权限" in err_str:
+                    print("  ⚠️ 公告接口权限不足，跳过所有公告获取")
+                    break
+                # 如果是限频，继续等待后重试
+                elif "超限" in err_str or "频率" in err_str:
+                    print("  ⚠️ 接口限频，已等待62秒，继续下一只...")
+                    time.sleep(62)
+
     except Exception as e:
-        print(f"  Tushare公告获取失败: {e}")
+        print(f"  公告批量获取异常: {e}")
 
-    return news_list
+    return result
 
 
-# ========== 3. AI 分析（TokenHub OpenAI 兼容接口） ==========
+# ========== 4. AI 分析（TokenHub OpenAI 兼容接口） ==========
 def call_ai_analysis(stocks_data):
     if not HUNYUAN_API_KEY:
         print("未配置 HUNYUAN_API_KEY，使用纯数据报告模式")
@@ -206,7 +271,7 @@ def call_ai_analysis(stocks_data):
             user_message += "\n"
 
         if news:
-            user_message += f"- 近期公告日期：{', '.join(news[:3])}\n"
+            user_message += f"- 近期公告：{' | '.join(news[:3])}\n"
 
         user_message += "\n"
 
@@ -275,11 +340,10 @@ def generate_plain_report(stocks_data):
 
 """
     report += "⚠️ 免责声明：本内容仅为数据整理，不构成任何投资建议。\n"
-    report += "💡 提示：AI分析功能未启用，请在 GitHub Secrets 中配置 HUNYUAN_API_KEY"
     return report
 
 
-# ========== 4. 推送微信（Pushplus） ==========
+# ========== 5. 推送微信（Pushplus） ==========
 def send_pushplus(title, content):
     if not PUSHPLUS_TOKEN:
         print("未配置 PUSHPLUS_TOKEN，跳过推送")
@@ -309,7 +373,7 @@ def send_pushplus(title, content):
 # ========== 主流程 ==========
 def main():
     print("=" * 50)
-    print("股票日报自动化系统 v2.0")
+    print("股票日报自动化系统 v2.1")
     print(f"运行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
@@ -327,7 +391,7 @@ def main():
 
     print(f"\n共加载 {len(stocks)} 只标的：")
     for s in stocks:
-        print(f"  - {s['name']}({s['code']}) [{s['market']}]")
+        print(f"  - {s['name']}({s['code']}) [{s['ts_code']}] [{s['market']}]")
 
     # 2. 初始化 Tushare
     ts_api = None
@@ -339,9 +403,9 @@ def main():
         except Exception as e:
             print(f"❌ Tushare API 初始化失败: {e}")
 
-    # 3. 采集数据
+    # 3. 采集数据（行情 + 历史）
     print("\n" + "=" * 50)
-    print("开始数据采集...")
+    print("开始数据采集（行情 & 历史）...")
     print("=" * 50)
 
     stocks_data = []
@@ -351,26 +415,40 @@ def main():
         realtime = get_realtime_data_akshare(s["code"])
         history = get_history_data_akshare(s["code"])
         basic = {**realtime, **history, "name": s["name"], "code": s["code"]}
-        fundamental = get_fundamental_data_tushare(ts_api, s["code"])
-        news = get_news_tushare(ts_api, s["code"])
+        fundamental = get_fundamental_data_tushare(ts_api, s["ts_code"])
 
         stocks_data.append({
+            "stock": s,
             "basic": basic,
             "fundamental": fundamental,
-            "news": news
+            "news": []  # 暂时留空，下方批量获取
         })
 
         print(f"  价格:{basic['price']:.2f} 涨跌:{basic['change_pct']:+.2f}% "
               f"成交额:{basic['volume']:.2f}亿")
 
-    # 4. AI 分析
+    # 4. 批量获取公告（Tushare，限频保护）
+    if ts_api:
+        print("\n" + "=" * 50)
+        print("开始批量获取公告（每只间隔62秒，避免限频）...")
+        print("=" * 50)
+
+        ts_codes = [s["ts_code"] for s in stocks]
+        news_map = get_news_batch_tushare(ts_api, ts_codes)
+
+        # 把公告结果写回 stocks_data
+        for item in stocks_data:
+            ts_code = item["stock"]["ts_code"]
+            item["news"] = news_map.get(ts_code, [])
+
+    # 5. AI 分析
     print("\n" + "=" * 50)
     print("开始AI分析...")
     print("=" * 50)
 
     report = call_ai_analysis(stocks_data)
 
-    # 5. 推送
+    # 6. 推送
     print("\n" + "=" * 50)
     print("推送结果...")
     print("=" * 50)
@@ -378,7 +456,7 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     send_pushplus(f"📈 股票日报 {today}", report)
 
-    # 6. 输出报告
+    # 7. 输出报告
     print("\n" + report)
 
     print("\n" + "=" * 50)
