@@ -1,14 +1,15 @@
 """
-股票日报自动化系统 v2.2
-架构：AKShare数据采集（行情+基本面+公告） → TokenHub AI分析 → Pushplus微信推送
+股票日报自动化系统 v2.3
+架构：新浪财经(备用行情) + AKShare(主力数据) → TokenHub AI分析 → Pushplus微信推送
 运行环境：GitHub Actions (ubuntu-latest, Python 3.10+)
 
 修复记录：
-  v2.2 - 全面改用 AKShare，移除 Tushare 依赖
-    - AKShare Connection aborted → 加重试机制（3次）+ 请求间隔
-    - Tushare daily_basic 需要2000积分（用户仅120积分），改用 AKShare stock_individual_info_em
-    - Tushare disclosure_date/anns 限频严重，改用 AKShare stock_notice_report
-    - 移除 tushare 依赖，不再需要 TUSHARE_TOKEN
+  v2.3 - 解决 GitHub Actions 境外 IP 被 AKShare/东方财富拒绝的问题
+    - 新增新浪财经备用数据源（解决 Connection aborted）
+    - AKShare 作为主力数据源，失败时自动降级到新浪
+    - 新浪接口支持一次批量查询（逗号分隔多个代码）
+    - 所有 AKShare 请求带 3 次重试 + 5 秒间隔
+    - 不依赖 tushare，不需要 TUSHARE_TOKEN
 """
 
 import os
@@ -19,18 +20,15 @@ import akshare as ak
 import pandas as pd
 from datetime import datetime, timedelta
 
-# ========== 配置区（从 GitHub Secrets 读取） ==========
+# ========== 配置区 ==========
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
-
-# TokenHub AI 配置（OpenAI 兼容格式）
 HUNYUAN_API_KEY = os.environ.get("HUNYUAN_API_KEY", "")
 HUNYUAN_BASE_URL = "https://tokenhub.tencentmaas.com/v1"
 HUNYUAN_MODEL = "deepseek-v4-flash"
 
-# AKShare 请求配置
-AKSHARE_MAX_RETRIES = 3        # 最大重试次数
-AKSHARE_RETRY_DELAY = 5        # 重试间隔（秒）
-AKSHARE_REQUEST_DELAY = 2      # 每次请求间隔（秒）
+# 重试配置
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 # AI 分析系统提示词
 SYSTEM_PROMPT = """#人设#
@@ -63,83 +61,166 @@ SYSTEM_PROMPT = """#人设#
 """
 
 
-# ========== 通用重试装饰器 ==========
-def retry_on_failure(func):
-    """AKShare 请求重试包装器，自动重试 3 次"""
-    def wrapper(*args, **kwargs):
-        last_error = None
-        for attempt in range(1, AKSHARE_MAX_RETRIES + 1):
-            try:
-                result = func(*args, **kwargs)
-                if attempt > 1:
-                    print(f"    ✅ 第{attempt}次重试成功")
-                return result
-            except Exception as e:
-                last_error = e
-                if attempt < AKSHARE_MAX_RETRIES:
-                    print(f"    ⚠️ 第{attempt}次请求失败: {e}，{AKSHARE_RETRY_DELAY}秒后重试...")
-                    time.sleep(AKSHARE_RETRY_DELAY)
-                else:
-                    print(f"    ❌ 重试{AKSHARE_MAX_RETRIES}次均失败: {e}")
-        return None
-    return wrapper
+# ========== 工具函数 ==========
+
+def to_sina_code(code: str) -> str:
+    """将纯数字代码转为新浪格式：sh600519 / sz000001"""
+    if code.startswith("6") or code.startswith("5"):
+        return "sh" + code
+    else:
+        return "sz" + code
 
 
-# ========== 股票列表 ==========
-def load_stock_list():
-    stocks = []
+def safe_float(val, default=0.0):
+    """安全转浮点数"""
     try:
-        with open("stock_list.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and " " in line:
-                    parts = line.split(maxsplit=1)
-                    code = parts[0].strip()
-                    name = parts[1].strip()
-                    stocks.append({"code": code, "name": name})
+        if val is None or val == "" or val == "-":
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+# ========== 1. 新浪财经：实时行情（备用数据源，支持批量） ==========
+
+def get_sina_realtime_batch(codes):
+    """
+    通过新浪财经批量获取实时行情（一次请求获取所有股票）
+    返回 dict: {code: {price, change_pct, volume, name, pre_close}}
+    """
+    result = {}
+    try:
+        sina_codes = [to_sina_code(c) for c in codes]
+        url = "http://hq.sinajs.cn/list=" + ",".join(sina_codes)
+        headers = {
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"  新浪接口返回 {resp.status_code}")
+            return result
+
+        for line in resp.text.strip().split("\n"):
+            if not line or "=" not in line:
+                continue
+            try:
+                # 解析: var hq_str_sh600519="贵州茅台,开盘价,昨收,当前价,最高,最低,买一价,买一量,卖一价,卖一量,成交量,成交额,...";
+                data_part = line.split('"')[1]
+                if not data_part or data_part == "":
+                    continue
+
+                # 提取代码
+                code_raw = line.split("=")[0].replace("var hq_str_", "")
+                # sh600519 -> 600519
+                code = code_raw[2:]
+
+                fields = data_part.split(",")
+                name = fields[0]
+                pre_close = safe_float(fields[2])
+                current = safe_float(fields[3])
+                high = safe_float(fields[4])
+                low = safe_float(fields[5])
+                volume_amount = safe_float(fields[9])  # 成交额（元）
+
+                # 计算涨跌幅
+                if pre_close > 0:
+                    change_pct = (current - pre_close) / pre_close * 100
+                else:
+                    change_pct = 0.0
+
+                result[code] = {
+                    "name": name,
+                    "price": current,
+                    "pre_close": pre_close,
+                    "change_pct": change_pct,
+                    "high": high,
+                    "low": low,
+                    "volume": volume_amount / 1e8,  # 转为亿元
+                }
+            except (IndexError, ValueError) as e:
+                continue
+
+        print(f"  ✅ 新浪财经获取到 {len(result)} 只标的行情")
     except Exception as e:
-        print(f"读取股票列表失败: {e}")
-    return stocks
+        print(f"  ❌ 新浪财经请求失败: {e}")
+
+    return result
 
 
-# ========== 1. AKShare：实时行情（带重试） ==========
-@retry_on_failure
-def fetch_spot_data():
-    return ak.stock_zh_a_spot_em()
+# ========== 2. AKShare：实时行情（带重试，主力数据源） ==========
+
+def fetch_with_retry(func, desc="请求"):
+    """通用重试包装"""
+    last_err = None
+    for i in range(1, MAX_RETRIES + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_err = e
+            if i < MAX_RETRIES:
+                print(f"    ⚠️ {desc} 第{i}次失败: {e}，{RETRY_DELAY}秒后重试...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"    ❌ {desc} 重试{MAX_RETRIES}次均失败: {e}")
+    return None
 
 
-def get_realtime_data(code):
-    """获取实时行情：最新价、涨跌幅、成交额"""
-    spot = fetch_spot_data()
+def get_akshare_realtime(code):
+    """通过 AKShare 获取单只股票实时行情"""
+    spot = fetch_with_retry(
+        lambda: ak.stock_zh_a_spot_em(),
+        desc=f"AKShare行情"
+    )
     if spot is None:
-        return {"price": 0.0, "change_pct": 0.0, "volume": 0.0}
+        return None
 
     row = spot[spot["代码"] == code]
     if row.empty:
-        print(f"    未找到 {code} 行情数据")
-        return {"price": 0.0, "change_pct": 0.0, "volume": 0.0}
+        return None
 
     return {
-        "price": float(row["最新价"].values[0]) if pd.notna(row["最新价"].values[0]) else 0.0,
-        "change_pct": float(row["涨跌幅"].values[0]) if pd.notna(row["涨跌幅"].values[0]) else 0.0,
-        "volume": float(row["成交额"].values[0]) / 1e8 if pd.notna(row["成交额"].values[0]) else 0.0,
+        "price": safe_float(row["最新价"].values[0]),
+        "change_pct": safe_float(row["涨跌幅"].values[0]),
+        "volume": safe_float(row["成交额"].values[0]) / 1e8,
     }
 
 
-# ========== 2. AKShare：3年历史数据（带重试） ==========
-@retry_on_failure
-def fetch_history_data(code):
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=365 * 3)).strftime("%Y%m%d")
-    return ak.stock_zh_a_hist(
-        symbol=code, period="daily",
-        start_date=start, end_date=end, adjust="qfq"
-    )
+def get_realtime_data(code, sina_data):
+    """获取实时行情：优先 AKShare，失败降级到新浪"""
+    # 先尝试 AKShare
+    ak_data = get_akshare_realtime(code)
+    if ak_data is not None and ak_data["price"] > 0:
+        print(f"    行情(AKShare): {ak_data['price']:.2f} {ak_data['change_pct']:+.2f}%")
+        return ak_data
 
+    # AKShare 失败，降级到新浪
+    if code in sina_data:
+        sd = sina_data[code]
+        print(f"    行情(新浪备用): {sd['price']:.2f} {sd['change_pct']:+.2f}%")
+        return {
+            "price": sd["price"],
+            "change_pct": sd["change_pct"],
+            "volume": sd["volume"],
+        }
+
+    print(f"    ❌ 行情获取完全失败")
+    return {"price": 0.0, "change_pct": 0.0, "volume": 0.0}
+
+
+# ========== 3. AKShare：3年历史数据（带重试） ==========
 
 def get_history_data(code):
     """获取近3年最高价、最低价、均价"""
-    hist = fetch_history_data(code)
+    hist = fetch_with_retry(
+        lambda: ak.stock_zh_a_hist(
+            symbol=code, period="daily",
+            start_date=(datetime.now() - timedelta(days=365*3)).strftime("%Y%m%d"),
+            end_date=datetime.now().strftime("%Y%m%d"),
+            adjust="qfq"
+        ),
+        desc=f"AKShare历史({code})"
+    )
     if hist is None or hist.empty:
         return {"high3y": 0.0, "low3y": 0.0, "avg3y": 0.0}
 
@@ -150,72 +231,57 @@ def get_history_data(code):
     }
 
 
-# ========== 3. AKShare：基本面数据（PE/PB） ==========
-@retry_on_failure
-def fetch_individual_info(code):
-    return ak.stock_individual_info_em(symbol=code)
-
+# ========== 4. AKShare：基本面 PE/PB（带重试） ==========
 
 def get_fundamental_data(code):
-    """通过 AKShare 获取 PE、PB 等基本面指标"""
+    """通过 AKShare 获取 PE、PB"""
     data = {"pe": None, "pb": None}
     try:
-        df = fetch_individual_info(code)
+        df = fetch_with_retry(
+            lambda: ak.stock_individual_info_em(symbol=code),
+            desc=f"AKShare基本面({code})"
+        )
         if df is not None and not df.empty:
-            # stock_individual_info_em 返回两列：item / value
             info_dict = dict(zip(df["item"], df["value"]))
-            # 尝试提取 PE、PB
-            for key in ["市盈率(动态)", "市盈率-动态", "PE(动)", "动态市盈率"]:
+            # 尝试多种可能的字段名
+            for key in ["市盈率(动态)", "市盈率-动态", "PE(动)", "动态市盈率", "市盈率"]:
                 if key in info_dict:
-                    try:
-                        data["pe"] = float(str(info_dict[key]).replace(",", ""))
-                    except (ValueError, TypeError):
-                        pass
+                    data["pe"] = safe_float(str(info_dict[key]).replace(",", ""))
                     break
-
             for key in ["市净率", "PB", "市净率MRQ"]:
                 if key in info_dict:
-                    try:
-                        data["pb"] = float(str(info_dict[key]).replace(",", ""))
-                    except (ValueError, TypeError):
-                        pass
+                    data["pb"] = safe_float(str(info_dict[key]).replace(",", ""))
                     break
-
             if data["pe"] is not None or data["pb"] is not None:
                 print(f"    PE={data['pe']}, PB={data['pb']}")
-            else:
-                print(f"    未找到PE/PB字段，可用字段: {list(info_dict.keys())[:10]}")
     except Exception as e:
         print(f"    基本面获取失败: {e}")
 
     return data
 
 
-# ========== 4. AKShare：公司公告/新闻 ==========
-@retry_on_failure
-def fetch_stock_notice(code):
-    return ak.stock_notice_report(symbol=code)
-
+# ========== 5. AKShare：公司公告（带重试） ==========
 
 def get_news_data(code):
-    """获取公司最新公告标题"""
+    """获取公司最新公告"""
     news_list = []
     try:
-        df = fetch_stock_notice(code)
+        df = fetch_with_retry(
+            lambda: ak.stock_notice_report(symbol=code),
+            desc=f"AKShare公告({code})"
+        )
         if df is not None and not df.empty:
-            # 取最近 3 条公告
             for _, row in df.head(3).iterrows():
                 title = str(row.get("标题", row.get("title", "")))
-                date = str(row.get("日期", row.get("date", "")))
-                news_list.append(f"{date} {title}")
+                news_list.append(title)
             print(f"    公告 {len(news_list)} 条")
     except Exception as e:
         print(f"    公告获取失败: {e}")
-
     return news_list
 
 
-# ========== 5. AI 分析（TokenHub OpenAI 兼容接口） ==========
+# ========== 6. AI 分析 ==========
+
 def call_ai_analysis(stocks_data):
     if not HUNYUAN_API_KEY:
         print("未配置 HUNYUAN_API_KEY，使用纯数据报告模式")
@@ -249,61 +315,43 @@ def call_ai_analysis(stocks_data):
         user_message += "\n"
 
     try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {HUNYUAN_API_KEY}"
-        }
-        payload = {
-            "model": HUNYUAN_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 4096
-        }
-
-        print("正在调用AI进行分析...")
         response = requests.post(
             f"{HUNYUAN_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {HUNYUAN_API_KEY}"
+            },
+            json={
+                "model": HUNYUAN_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 4096
+            },
             timeout=60
         )
         response.raise_for_status()
-        result = response.json()
-
-        ai_report = result["choices"][0]["message"]["content"]
+        ai_report = response.json()["choices"][0]["message"]["content"]
         print("✅ AI分析完成")
         return ai_report
-
-    except requests.exceptions.Timeout:
-        print("❌ AI接口请求超时，使用纯数据报告")
-        return generate_plain_report(stocks_data)
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ AI接口请求失败: {e}")
-        return generate_plain_report(stocks_data)
     except Exception as e:
-        print(f"❌ AI分析异常: {e}")
+        print(f"❌ AI分析失败: {e}，使用纯数据报告")
         return generate_plain_report(stocks_data)
 
 
 def generate_plain_report(stocks_data):
-    """AI不可用时的纯数据报告（降级方案）"""
     report = "📈 自选标的日报（数据版，AI分析暂不可用）\n\n"
-
     for item in stocks_data:
         d = item["basic"]
         f = item.get("fundamental", {})
-
         if d["high3y"] > d["low3y"]:
             position = (d["price"] - d["low3y"]) / (d["high3y"] - d["low3y"]) * 100
         else:
             position = 50.0
-
         pe_str = f"{f['pe']:.2f}" if f.get("pe") is not None else "暂无数据"
         pb_str = f"{f['pb']:.2f}" if f.get("pb") is not None else "暂无数据"
-
         report += f"""【{d['name']} · {d['code']}】
 【最新价】：{d['price']:.2f} 元 | 涨跌幅：{d['change_pct']:+.2f}% | 成交额：{d['volume']:.2f} 亿
 【历史位置】：当前价处于近3年区间的 {position:.1f}%（最高{d['high3y']:.2f} / 最低{d['low3y']:.2f} / 均价{d['avg3y']:.2f}）
@@ -314,22 +362,23 @@ def generate_plain_report(stocks_data):
     return report
 
 
-# ========== 6. 推送微信（Pushplus） ==========
+# ========== 7. 推送微信 ==========
+
 def send_pushplus(title, content):
     if not PUSHPLUS_TOKEN:
         print("未配置 PUSHPLUS_TOKEN，跳过推送")
         return False
-
     try:
-        url = "https://www.pushplus.plus/send"
-        data = {
-            "token": PUSHPLUS_TOKEN,
-            "title": title,
-            "content": content.replace("\n", "<br>"),
-            "template": "html"
-        }
-        response = requests.post(url, json=data, timeout=10)
-        result = response.json()
+        result = requests.post(
+            "https://www.pushplus.plus/send",
+            json={
+                "token": PUSHPLUS_TOKEN,
+                "title": title,
+                "content": content.replace("\n", "<br>"),
+                "template": "html"
+            },
+            timeout=10
+        ).json()
         if result.get("code") == 200:
             print("✅ Pushplus推送成功")
             return True
@@ -342,67 +391,67 @@ def send_pushplus(title, content):
 
 
 # ========== 主流程 ==========
+
 def main():
     print("=" * 50)
-    print("股票日报自动化系统 v2.2（纯AKShare版）")
+    print("股票日报自动化系统 v2.3（新浪备用+AKShare）")
     print(f"运行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
-    # 0. 检查配置
     print(f"\n配置检查：")
-    print(f"  PUSHPLUS_TOKEN: {'✅ 已配置' if PUSHPLUS_TOKEN else '⚠️ 未配置'}")
-    print(f"  HUNYUAN_API_KEY: {'✅ 已配置' if HUNYUAN_API_KEY else '⚠️ 未配置（将使用数据版）'}")
+    print(f"  PUSHPLUS_TOKEN: {'✅' if PUSHPLUS_TOKEN else '⚠️'}")
+    print(f"  HUNYUAN_API_KEY: {'✅' if HUNYUAN_API_KEY else '⚠️'}")
 
     # 1. 加载股票列表
-    stocks = load_stock_list()
-    if not stocks:
-        print("❌ 未找到股票列表，请检查 stock_list.txt")
+    stocks = []
+    try:
+        with open("stock_list.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and " " in line:
+                    parts = line.split(maxsplit=1)
+                    stocks.append({"code": parts[0].strip(), "name": parts[1].strip()})
+    except Exception as e:
+        print(f"❌ 读取股票列表失败: {e}")
         sys.exit(1)
 
-    print(f"\n共加载 {len(stocks)} 只标的：")
+    print(f"\n共 {len(stocks)} 只标的：")
     for s in stocks:
         print(f"  - {s['name']}({s['code']})")
 
-    # 2. 先批量获取全市场行情（只请求一次）
+    codes = [s["code"] for s in stocks]
+
+    # 2. 新浪财经批量获取实时行情（备用数据源，一次请求搞定）
     print("\n" + "=" * 50)
-    print("批量获取全市场实时行情...")
+    print("[1/3] 新浪财经批量获取行情（备用）...")
     print("=" * 50)
+    sina_data = get_sina_realtime_batch(codes)
+    if sina_data:
+        print(f"  ✅ 新浪备用数据就绪（{len(sina_data)}只）")
+    else:
+        print(f"  ⚠️ 新浪也失败了，仅靠 AKShare")
 
-    spot_df = fetch_spot_data()
-    if spot_df is None:
-        print("❌ 全市场行情获取失败，退出")
-        sys.exit(1)
-    print(f"✅ 获取到 {len(spot_df)} 只标的行情")
-
-    # 3. 逐只采集数据
+    # 3. 逐只采集详细数据
     print("\n" + "=" * 50)
-    print("开始逐只采集详细数据...")
+    print("[2/3] 逐只采集详细数据...")
     print("=" * 50)
 
     stocks_data = []
     for idx, s in enumerate(stocks):
         code = s["code"]
-        print(f"\n[{idx+1}/{len(stocks)}] 处理 {s['name']}({code})...")
+        print(f"\n[{idx+1}/{len(stocks)}] {s['name']}({code})...")
 
-        # 实时行情（从已获取的全量数据中过滤，不再重复请求）
-        row = spot_df[spot_df["代码"] == code]
-        if not row.empty:
-            realtime = {
-                "price": float(row["最新价"].values[0]) if pd.notna(row["最新价"].values[0]) else 0.0,
-                "change_pct": float(row["涨跌幅"].values[0]) if pd.notna(row["涨跌幅"].values[0]) else 0.0,
-                "volume": float(row["成交额"].values[0]) / 1e8 if pd.notna(row["成交额"].values[0]) else 0.0,
-            }
-        else:
-            print(f"    ⚠️ 未在行情列表中找到 {code}")
-            realtime = {"price": 0.0, "change_pct": 0.0, "volume": 0.0}
+        # 实时行情：AKShare 优先，新浪兜底
+        realtime = get_realtime_data(code, sina_data)
 
-        # 历史数据（带重试）
+        # 历史数据
         history = get_history_data(code)
+        print(f"    3年区间: {history['low3y']:.2f} ~ {history['high3y']:.2f} 均价{history['avg3y']:.2f}")
 
-        # 基本面 PE/PB（带重试）
+        # 基本面 PE/PB
         fundamental = get_fundamental_data(code)
 
-        # 公司公告（带重试）
+        # 公告
         news = get_news_data(code)
 
         basic = {**realtime, **history, "name": s["name"], "code": code}
@@ -412,31 +461,20 @@ def main():
             "news": news
         })
 
-        print(f"    价格:{basic['price']:.2f} 涨跌:{basic['change_pct']:+.2f}% "
-              f"成交额:{basic['volume']:.2f}亿")
-
-        # 请求间隔，避免被限
+        # 请求间隔
         if idx < len(stocks) - 1:
-            time.sleep(AKSHARE_REQUEST_DELAY)
+            time.sleep(2)
 
     # 4. AI 分析
     print("\n" + "=" * 50)
-    print("开始AI分析...")
+    print("[3/3] AI 分析 & 推送...")
     print("=" * 50)
 
     report = call_ai_analysis(stocks_data)
-
-    # 5. 推送
-    print("\n" + "=" * 50)
-    print("推送结果...")
-    print("=" * 50)
-
     today = datetime.now().strftime("%Y-%m-%d")
     send_pushplus(f"📈 股票日报 {today}", report)
 
-    # 6. 输出报告
     print("\n" + report)
-
     print("\n" + "=" * 50)
     print("=== 任务完成 ===")
     print("=" * 50)
